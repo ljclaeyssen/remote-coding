@@ -1,0 +1,6 @@
+.claude/
+.idea/
+TODO.md
+node_modules/
+.env
+*.log

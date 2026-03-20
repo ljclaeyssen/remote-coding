@@ -1,0 +1,15 @@
+[Unit]
+Description=Claude Discord Launcher Bot
+After=network.target
+
+[Service]
+Type=simple
+User=deploy
+WorkingDirectory=/home/deploy/remote-coding
+ExecStart=/usr/bin/node src/bot.js
+EnvironmentFile=/home/deploy/remote-coding/.env
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
