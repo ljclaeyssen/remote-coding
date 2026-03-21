@@ -6,9 +6,9 @@ import { setNotifyOwner, setSendToChannel } from './state.js';
 import { ensureBaseDir } from './services/repo-manager.js';
 import {
   isRunning, getMemoryUsage, stopSession, getSession,
-  startSession, setChannelId, getAllSessions,
+  startSession, setChannelId, getAllSessions, cleanOrphanSessions,
 } from './services/claude-process.js';
-import { removeChannelGroup } from './services/access-manager.js';
+import { removeChannelGroup, getChannelGroups, clearAllGroups } from './services/access-manager.js';
 import { startWatchdog, stopWatchdog } from './watchdog.js';
 import { notifyOwner } from './state.js';
 
@@ -35,17 +35,41 @@ if (!OWNER_DISCORD_ID) {
   process.exit(1);
 }
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+});
 
 // Register commands
 const commands = new Collection();
 commands.set(claudeCmd.data.name, claudeCmd);
 commands.set(reposCmd.data.name, reposCmd);
 
-client.once('ready', () => {
+client.once('ready', async () => {
   console.log(`Bot online as ${client.user.tag}`);
 
   ensureBaseDir();
+
+  // Kill orphan tmux sessions from previous bot runs
+  const orphans = cleanOrphanSessions();
+  if (orphans > 0) {
+    console.log(`Cleaned ${orphans} orphan tmux session(s)`);
+  }
+
+  // Clean orphan Discord channels + access.json groups
+  const orphanChannels = getChannelGroups();
+  if (orphanChannels.length > 0) {
+    console.log(`Cleaning ${orphanChannels.length} orphan channel(s) from access.json...`);
+    for (const channelId of orphanChannels) {
+      try {
+        const channel = await client.channels.fetch(channelId);
+        if (channel) await channel.delete('Bot restart — orphan session channel');
+        console.log(`Deleted orphan channel: ${channelId}`);
+      } catch {
+        // Channel already gone or can't be fetched
+      }
+    }
+    clearAllGroups();
+  }
 
   // Set up owner notification via DM
   setNotifyOwner(async (msg) => {
@@ -140,6 +164,13 @@ client.on('interactionCreate', async (interaction) => {
       // Can't respond, swallow
     }
   }
+});
+
+// Reanchor watch when owner sends a message in a watched channel
+client.on('messageCreate', async (message) => {
+  if (message.author.id !== OWNER_DISCORD_ID) return;
+  if (message.author.bot) return;
+  await claudeCmd.reanchorWatch(message.channelId, client);
 });
 
 // Global error handlers

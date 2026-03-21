@@ -9,6 +9,84 @@ import { addChannelGroup, removeChannelGroup } from '../services/access-manager.
 import { getBaseDir, getRepoPath } from '../services/repo-manager.js';
 import { notifyOwner } from '../state.js';
 
+const WATCH_INTERVAL_SEC = 5;
+
+// Watch state per channel: { intervalId, msg, sessionName, lastScreen }
+const watchers = new Map();
+
+function startWatch(channelId, sessionName, client) {
+  if (watchers.has(channelId)) return;
+
+  const watcher = { intervalId: null, msg: null, sessionName, lastScreen: '' };
+
+  watcher.intervalId = setInterval(async () => {
+    if (!isRunning(sessionName)) {
+      clearInterval(watcher.intervalId);
+      watchers.delete(channelId);
+      if (watcher.msg) {
+        await watcher.msg.edit('```\n(session ended)\n```').catch(() => {});
+      }
+      return;
+    }
+
+    try {
+      const screen = captureScreen(sessionName).trimEnd();
+      if (screen && screen !== watcher.lastScreen) {
+        watcher.lastScreen = screen;
+        const maxLen = 1980;
+        const content = screen.length > maxLen ? '...' + screen.slice(-maxLen) : screen;
+        const text = `\`\`\`\n${content}\n\`\`\``;
+
+        if (watcher.msg) {
+          await watcher.msg.edit(text).catch(() => {});
+        } else {
+          const channel = await client.channels.fetch(channelId);
+          watcher.msg = await channel.send(text);
+        }
+      }
+    } catch {
+      // Non-fatal, retry next tick
+    }
+  }, WATCH_INTERVAL_SEC * 1000);
+
+  watchers.set(channelId, watcher);
+}
+
+function stopWatch(channelId) {
+  const watcher = watchers.get(channelId);
+  if (!watcher) return;
+  clearInterval(watcher.intervalId);
+  if (watcher.msg) {
+    watcher.msg.delete().catch(() => {});
+  }
+  watchers.delete(channelId);
+}
+
+export async function reanchorWatch(channelId, client) {
+  const watcher = watchers.get(channelId);
+  if (!watcher) return;
+
+  // Delete old watch message
+  if (watcher.msg) {
+    await watcher.msg.delete().catch(() => {});
+    watcher.msg = null;
+  }
+
+  // Immediately post a fresh screen
+  try {
+    const screen = captureScreen(watcher.sessionName).trimEnd();
+    if (screen) {
+      const maxLen = 1980;
+      const content = screen.length > maxLen ? '...' + screen.slice(-maxLen) : screen;
+      const channel = await client.channels.fetch(channelId);
+      watcher.msg = await channel.send(`\`\`\`\n${content}\n\`\`\``);
+      watcher.lastScreen = screen;
+    }
+  } catch {
+    // Next interval will retry
+  }
+}
+
 export const data = new SlashCommandBuilder()
   .setName('claude')
   .setDescription('Control Claude Code sessions')
@@ -135,8 +213,12 @@ async function handleStart(interaction) {
   try {
     const result = startSession(sessionName, cwd, async (code, signal) => {
       notifyOwner(`Claude **${sessionName}** exited (code=${code}, signal=${signal}).`);
+      stopWatch(channel.id);
     });
     setChannelId(sessionName, channel.id);
+
+    // 4. Auto-start watch
+    startWatch(channel.id, sessionName, interaction.client);
 
     return interaction.editReply(`Claude started in **${sessionName}** (PID ${result.pid}). Channel: <#${channel.id}>`);
   } catch (err) {
@@ -158,7 +240,8 @@ async function handleStop(interaction) {
 
   const { name, repoName, channelId } = session;
 
-  // 1. Stop tmux
+  // 1. Stop watch + tmux
+  stopWatch(channelId);
   await stopSession(name);
 
   // 2. Remove from access.json
@@ -174,7 +257,6 @@ async function handleStop(interaction) {
   try {
     const channel = interaction.client.channels.cache.get(channelId);
     if (channel) {
-      // Small delay so the user can see the message
       setTimeout(() => deleteSessionChannel(channel), 2000);
     }
   } catch {
@@ -197,7 +279,6 @@ async function handleScreen(interaction) {
       return interaction.reply({ content: '*(empty screen)*', ephemeral: true });
     }
 
-    // Discord max message length is 2000, code block takes ~10 chars
     const maxLen = 1980;
     const content = trimmed.length > maxLen ? '...' + trimmed.slice(-maxLen) : trimmed;
 

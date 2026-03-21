@@ -32,3 +32,14 @@ export function removeChannelGroup(channelId) {
   delete data.groups[channelId];
   writeAccess(data);
 }
+
+export function getChannelGroups() {
+  const data = readAccess();
+  return Object.keys(data.groups);
+}
+
+export function clearAllGroups() {
+  const data = readAccess();
+  data.groups = {};
+  writeAccess(data);
+}

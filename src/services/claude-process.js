@@ -7,6 +7,25 @@ function tmuxName(name) {
   return `claude-${name}`;
 }
 
+export function cleanOrphanSessions() {
+  try {
+    const output = execSync('tmux ls -F "#{session_name}"', { encoding: 'utf-8' });
+    const orphans = output.trim().split('\n').filter((s) => s.startsWith('claude-') && !sessions.has(s.slice('claude-'.length)));
+    for (const name of orphans) {
+      try {
+        execFileSync('tmux', ['kill-session', '-t', name]);
+        console.log(`Killed orphan tmux session: ${name}`);
+      } catch {
+        // Already dead
+      }
+    }
+    return orphans.length;
+  } catch {
+    // No tmux server or no sessions
+    return 0;
+  }
+}
+
 export function startSession(name, cwd, onExit) {
   if (sessions.has(name)) {
     throw new Error(`Session "${name}" already running`);
