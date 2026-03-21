@@ -1,29 +1,33 @@
 let intervalId = null;
-let warningNotified = false;
+const warningState = new Map(); // sessionName → boolean
 
-export function startWatchdog({ getMemoryUsage, isRunning, restartFn, notifyFn, maxMb }) {
+export function startWatchdog({ getAllSessions, getMemoryUsage, isRunning, restartFn, notifyFn, maxMb }) {
   stopWatchdog();
 
   intervalId = setInterval(async () => {
-    if (!isRunning()) {
-      warningNotified = false;
-      return;
-    }
+    const sessions = getAllSessions();
 
-    const memMb = getMemoryUsage();
-    if (memMb === null) return;
+    for (const session of sessions) {
+      if (!isRunning(session.name)) {
+        warningState.delete(session.name);
+        continue;
+      }
 
-    const pct = (memMb / maxMb) * 100;
+      const memMb = getMemoryUsage(session.name);
+      if (memMb === null) continue;
 
-    if (memMb >= maxMb) {
-      await notifyFn(`⚠️ Claude memory at ${memMb} MB (${Math.round(pct)}% of ${maxMb} MB limit). Restarting...`);
-      await restartFn();
-      warningNotified = false;
-    } else if (pct >= 80 && !warningNotified) {
-      await notifyFn(`⚠️ Claude memory at ${memMb} MB (${Math.round(pct)}% of ${maxMb} MB limit).`);
-      warningNotified = true;
-    } else if (pct < 70) {
-      warningNotified = false;
+      const pct = (memMb / maxMb) * 100;
+
+      if (memMb >= maxMb) {
+        await notifyFn(`⚠️ **${session.repoName}** memory at ${memMb} MB (${Math.round(pct)}% of ${maxMb} MB limit). Restarting...`);
+        await restartFn(session.name);
+        warningState.delete(session.name);
+      } else if (pct >= 80 && !warningState.get(session.name)) {
+        await notifyFn(`⚠️ **${session.repoName}** memory at ${memMb} MB (${Math.round(pct)}% of ${maxMb} MB limit).`);
+        warningState.set(session.name, true);
+      } else if (pct < 70) {
+        warningState.delete(session.name);
+      }
     }
   }, 30_000);
 }
@@ -33,5 +37,5 @@ export function stopWatchdog() {
     clearInterval(intervalId);
     intervalId = null;
   }
-  warningNotified = false;
+  warningState.clear();
 }

@@ -2,6 +2,7 @@
 
 let _notifyOwner = async () => {};
 let _onClaudeExit = async () => {};
+let _sendToChannel = async () => {};
 
 export function setNotifyOwner(fn) {
   _notifyOwner = fn;
@@ -17,4 +18,12 @@ export function setOnClaudeExit(fn) {
 
 export function onClaudeExit(code, signal) {
   return _onClaudeExit(code, signal);
+}
+
+export function setSendToChannel(fn) {
+  _sendToChannel = fn;
+}
+
+export function sendToChannel(channelId, msg) {
+  return _sendToChannel(channelId, msg);
 }

@@ -1,8 +1,14 @@
 import 'dotenv/config';
+import { writeFileSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { Client, Collection, GatewayIntentBits } from 'discord.js';
-import { setNotifyOwner } from './state.js';
+import { setNotifyOwner, setSendToChannel } from './state.js';
 import { ensureBaseDir } from './services/repo-manager.js';
-import { isRunning, getMemoryUsage, stopSession, getSession, startSession } from './services/claude-process.js';
+import {
+  isRunning, getMemoryUsage, stopSession, getSession,
+  startSession, setChannelId, getAllSessions,
+} from './services/claude-process.js';
+import { removeChannelGroup } from './services/access-manager.js';
 import { startWatchdog, stopWatchdog } from './watchdog.js';
 import { notifyOwner } from './state.js';
 
@@ -10,10 +16,17 @@ import { notifyOwner } from './state.js';
 import * as claudeCmd from './commands/claude.js';
 import * as reposCmd from './commands/repos.js';
 
-const { DISCORD_BOT_TOKEN, OWNER_DISCORD_ID, CLAUDE_MAX_MEMORY_MB = '2048' } = process.env;
+const { LAUNCHER_BOT_TOKEN, PLUGIN_BOT_TOKEN, OWNER_DISCORD_ID, CLAUDE_MAX_MEMORY_MB = '2048' } = process.env;
 
-if (!DISCORD_BOT_TOKEN) {
-  console.error('DISCORD_BOT_TOKEN is required');
+// Sync plugin bot token to ~/.claude/channels/discord/.env
+if (PLUGIN_BOT_TOKEN) {
+  const pluginDir = join(process.env.HOME, '.claude', 'channels', 'discord');
+  mkdirSync(pluginDir, { recursive: true });
+  writeFileSync(join(pluginDir, '.env'), `DISCORD_BOT_TOKEN=${PLUGIN_BOT_TOKEN}\n`);
+}
+
+if (!LAUNCHER_BOT_TOKEN) {
+  console.error('LAUNCHER_BOT_TOKEN is required');
   process.exit(1);
 }
 
@@ -44,25 +57,38 @@ client.once('ready', () => {
     }
   });
 
+  // Set up channel messaging
+  setSendToChannel(async (channelId, msg) => {
+    try {
+      const channel = await client.channels.fetch(channelId);
+      if (channel) await channel.send(msg);
+    } catch (err) {
+      console.error(`Failed to send to channel ${channelId}:`, err.message);
+    }
+  });
+
   // Start watchdog
   const maxMb = parseInt(CLAUDE_MAX_MEMORY_MB, 10);
   startWatchdog({
+    getAllSessions,
     getMemoryUsage,
     isRunning,
     maxMb,
     notifyFn: (msg) => notifyOwner(msg),
-    restartFn: async () => {
-      const session = getSession();
+    restartFn: async (name) => {
+      const session = getSession(name);
       const cwd = session?.cwd;
-      await stopSession();
+      const channelId = session?.channelId;
+      await stopSession(name);
       if (cwd) {
         try {
-          startSession(cwd, (code, signal) => {
-            notifyOwner(`Claude exited after watchdog restart (code=${code}, signal=${signal}).`);
+          startSession(name, cwd, (code, signal) => {
+            notifyOwner(`Claude **${name}** exited after watchdog restart (code=${code}, signal=${signal}).`);
           });
-          await notifyOwner('Claude restarted by watchdog.');
+          if (channelId) setChannelId(name, channelId);
+          await notifyOwner(`Claude **${name}** restarted by watchdog.`);
         } catch (err) {
-          await notifyOwner(`Watchdog restart failed: ${err.message}`);
+          await notifyOwner(`Watchdog restart of **${name}** failed: ${err.message}`);
         }
       }
     },
@@ -125,25 +151,28 @@ process.on('uncaughtException', (err) => {
   console.error('Uncaught exception:', err);
 });
 
-// Graceful shutdown
-process.on('SIGINT', async () => {
+// Graceful shutdown — stop all sessions
+async function shutdown() {
   console.log('Shutting down...');
   stopWatchdog();
-  if (isRunning()) {
-    await stopSession();
+
+  const sessions = getAllSessions();
+  for (const session of sessions) {
+    try {
+      await stopSession(session.name);
+      if (session.channelId) {
+        removeChannelGroup(session.channelId);
+      }
+    } catch {
+      // Best effort
+    }
   }
+
   client.destroy();
   process.exit(0);
-});
+}
 
-process.on('SIGTERM', async () => {
-  console.log('Shutting down...');
-  stopWatchdog();
-  if (isRunning()) {
-    await stopSession();
-  }
-  client.destroy();
-  process.exit(0);
-});
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
 
-client.login(DISCORD_BOT_TOKEN);
+client.login(LAUNCHER_BOT_TOKEN);

@@ -1,6 +1,8 @@
 import { SlashCommandBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
-import { startSession, stopSession, getSession, isRunning } from '../services/claude-process.js';
+import { isRunning, getSession, startSession, setChannelId } from '../services/claude-process.js';
 import { cloneRepo, listRepos, pullRepo, getRepoPath } from '../services/repo-manager.js';
+import { createSessionChannel, deleteSessionChannel } from '../services/channel-manager.js';
+import { addChannelGroup, removeChannelGroup } from '../services/access-manager.js';
 import { notifyOwner } from '../state.js';
 
 export const data = new SlashCommandBuilder()
@@ -17,7 +19,7 @@ export const data = new SlashCommandBuilder()
   .addSubcommand((sub) =>
     sub
       .setName('open')
-      .setDescription('Open a repository (pull + start Claude)')
+      .setDescription('Pull latest and start a Claude session')
       .addStringOption((opt) => opt.setName('name').setDescription('Repository name').setRequired(true).setAutocomplete(true)),
   );
 
@@ -41,47 +43,15 @@ export async function execute(interaction) {
   }
 }
 
-function makeExitHandler() {
-  return (code, signal) => {
-    notifyOwner(`Claude exited (code=${code}, signal=${signal}).`);
-  };
-}
-
-async function startInRepo(repoPath) {
-  return startSession(repoPath, makeExitHandler());
-}
-
-function confirmationRow(repoName) {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`confirm_switch:${repoName}`).setLabel('Confirm').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId('cancel_switch').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
-  );
-}
-
 async function handleClone(interaction) {
   await interaction.deferReply();
   const url = interaction.options.getString('url');
 
-  let repo;
   try {
-    repo = cloneRepo(url);
+    const repo = cloneRepo(url);
+    return interaction.editReply(`Cloned **${repo.name}**. Use \`/claude start ${repo.name}\` or \`/repos open ${repo.name}\` to start a session.`);
   } catch (err) {
     return interaction.editReply(`Clone failed: ${err.message}`);
-  }
-
-  if (isRunning()) {
-    const session = getSession();
-    return interaction.editReply({
-      content: `Cloned **${repo.name}**. Session active on **${session.repoName}**. Switch to **${repo.name}**?`,
-      components: [confirmationRow(repo.name)],
-    });
-  }
-
-  try {
-    const result = await startInRepo(repo.path);
-    return interaction.editReply(`Cloned **${repo.name}** and started Claude (PID ${result.pid}).`);
-  } catch (err) {
-    return interaction.editReply(`Cloned **${repo.name}** but failed to start Claude: ${err.message}`);
   }
 }
 
@@ -98,7 +68,12 @@ async function handleList(interaction) {
     ),
   );
 
-  const names = repos.map((r) => `- **${r.name}**`).join('\n');
+  const names = repos.map((r) => {
+    const running = isRunning(r.name);
+    const prefix = running ? '🟢' : '⚪';
+    return `${prefix} **${r.name}**`;
+  }).join('\n');
+
   return interaction.reply({ content: `**Repositories:**\n${names}`, components: rows });
 }
 
@@ -111,27 +86,51 @@ async function handleOpen(interaction) {
     return interaction.editReply(`Repo **${name}** not found.`);
   }
 
+  // Already running? Just point to the channel
+  if (isRunning(name)) {
+    const session = getSession(name);
+    return interaction.editReply(`**${name}** already running. Channel: <#${session.channelId}>`);
+  }
+
+  // Pull latest
   try {
     pullRepo(name);
   } catch {
-    // Pull failure is non-fatal — continue with existing state
+    // Non-fatal
   }
 
-  if (isRunning()) {
-    const session = getSession();
-    if (session.repoName === name) {
-      return interaction.editReply(`Already running on **${name}**.`);
-    }
-    return interaction.editReply({
-      content: `Session active on **${session.repoName}**. Switch to **${name}**?`,
-      components: [confirmationRow(name)],
-    });
+  // Start session (same flow as /claude start)
+  const guildId = process.env.DISCORD_GUILD_ID;
+  if (!guildId) {
+    return interaction.editReply('`DISCORD_GUILD_ID` not configured in .env');
+  }
+
+  const guild = interaction.client.guilds.cache.get(guildId) || await interaction.client.guilds.fetch(guildId);
+  const categoryId = process.env.DISCORD_CATEGORY_ID || null;
+
+  let channel;
+  try {
+    channel = await createSessionChannel(guild, name, categoryId);
+  } catch (err) {
+    return interaction.editReply(`Failed to create channel: ${err.message}`);
   }
 
   try {
-    const result = await startInRepo(repoPath);
-    return interaction.editReply(`Opened **${name}** and started Claude (PID ${result.pid}).`);
+    addChannelGroup(channel.id);
   } catch (err) {
+    await deleteSessionChannel(channel);
+    return interaction.editReply(`Failed to update access.json: ${err.message}`);
+  }
+
+  try {
+    const result = startSession(name, repoPath, async (code, signal) => {
+      notifyOwner(`Claude **${name}** exited (code=${code}, signal=${signal}).`);
+    });
+    setChannelId(name, channel.id);
+    return interaction.editReply(`Opened **${name}** (PID ${result.pid}). Channel: <#${channel.id}>`);
+  } catch (err) {
+    removeChannelGroup(channel.id);
+    await deleteSessionChannel(channel);
     return interaction.editReply(`Failed to start Claude in **${name}**: ${err.message}`);
   }
 }
@@ -140,55 +139,52 @@ async function handleOpen(interaction) {
 export async function handleButton(interaction) {
   const customId = interaction.customId;
 
-  if (customId === 'cancel_switch') {
-    return interaction.update({ content: 'Cancelled.', components: [] });
-  }
+  if (!customId.startsWith('open_repo:')) return;
 
-  let repoName;
-  if (customId.startsWith('confirm_switch:')) {
-    repoName = customId.slice('confirm_switch:'.length);
-  } else if (customId.startsWith('open_repo:')) {
-    repoName = customId.slice('open_repo:'.length);
-  } else {
-    return;
-  }
-
+  const repoName = customId.slice('open_repo:'.length);
   const repoPath = getRepoPath(repoName);
+
   if (!repoPath) {
     return interaction.update({ content: `Repo **${repoName}** not found.`, components: [] });
   }
 
-  // For open_repo buttons, try pull first
-  if (customId.startsWith('open_repo:')) {
-    // If session already on this repo, skip
-    if (isRunning() && getSession().repoName === repoName) {
-      return interaction.update({ content: `Already running on **${repoName}**.`, components: [] });
-    }
-
-    try {
-      pullRepo(repoName);
-    } catch {
-      // Non-fatal
-    }
-
-    if (isRunning()) {
-      const session = getSession();
-      return interaction.update({
-        content: `Session active on **${session.repoName}**. Switch to **${repoName}**?`,
-        components: [confirmationRow(repoName)],
-      });
-    }
+  // Already running? Point to channel
+  if (isRunning(repoName)) {
+    const session = getSession(repoName);
+    return interaction.update({ content: `**${repoName}** already running. Channel: <#${session.channelId}>`, components: [] });
   }
 
-  // Stop existing session if running
-  if (isRunning()) {
-    await stopSession();
-  }
+  // Pull + start (same flow as handleOpen)
+  await interaction.update({ content: `Opening **${repoName}**...`, components: [] });
 
   try {
-    const result = await startInRepo(repoPath);
-    return interaction.update({ content: `Switched to **${repoName}** (PID ${result.pid}).`, components: [] });
+    pullRepo(repoName);
+  } catch {
+    // Non-fatal
+  }
+
+  const guildId = process.env.DISCORD_GUILD_ID;
+  if (!guildId) {
+    return interaction.editReply('`DISCORD_GUILD_ID` not configured.');
+  }
+
+  const guild = interaction.client.guilds.cache.get(guildId) || await interaction.client.guilds.fetch(guildId);
+  const categoryId = process.env.DISCORD_CATEGORY_ID || null;
+
+  let channel;
+  try {
+    channel = await createSessionChannel(guild, repoName, categoryId);
+    addChannelGroup(channel.id);
+    const result = startSession(repoName, repoPath, async (code, signal) => {
+      notifyOwner(`Claude **${repoName}** exited (code=${code}, signal=${signal}).`);
+    });
+    setChannelId(repoName, channel.id);
+    await interaction.editReply(`Opened **${repoName}** (PID ${result.pid}). Channel: <#${channel.id}>`);
   } catch (err) {
-    return interaction.update({ content: `Failed to start Claude in **${repoName}**: ${err.message}`, components: [] });
+    if (channel) {
+      removeChannelGroup(channel.id);
+      await deleteSessionChannel(channel).catch(() => {});
+    }
+    await interaction.editReply(`Failed to open **${repoName}**: ${err.message}`);
   }
 }

@@ -1,88 +1,107 @@
-import { spawn, execFileSync } from 'node:child_process';
+import { execFileSync, execSync } from 'node:child_process';
 
-let currentSession = null;
+/** @type {Map<string, {cwd: string, repoName: string, startedAt: number, channelId: string|null, pollInterval: ReturnType<typeof setInterval>}>} */
+const sessions = new Map();
 
-export function startSession(cwd, onExit) {
-  if (currentSession) {
-    throw new Error(`Session already running (PID ${currentSession.process.pid}) in ${currentSession.repoName}`);
+function tmuxName(name) {
+  return `claude-${name}`;
+}
+
+export function startSession(name, cwd, onExit) {
+  if (sessions.has(name)) {
+    throw new Error(`Session "${name}" already running`);
   }
 
   const repoName = cwd.split('/').pop();
-  let proc;
+  const bunPath = `${process.env.HOME}/.bun/bin`;
+  const pathEnv = `${bunPath}:${process.env.PATH}`;
+  const tmux = tmuxName(name);
 
   try {
-    proc = spawn('claude', ['--channels', 'plugin:discord@claude-plugins-official'], {
-      stdio: 'pipe',
-      cwd,
-    });
+    execSync(
+      `tmux new-session -d -s ${tmux} -c '${cwd}' 'export PATH="${pathEnv}" && claude --permission-mode acceptEdits --channels plugin:discord@claude-plugins-official'`,
+    );
   } catch (err) {
-    if (err.code === 'ENOENT') {
-      throw new Error('claude binary not found in PATH');
-    }
-    throw err;
+    throw new Error(`Failed to start tmux session: ${err.message}`);
   }
 
-  proc.on('error', (err) => {
-    if (err.code === 'ENOENT') {
-      currentSession = null;
-      onExit?.(-1, null);
-    }
-  });
-
-  proc.on('exit', (code, signal) => {
-    currentSession = null;
-    onExit?.(code, signal);
-  });
-
-  currentSession = {
-    process: proc,
+  const session = {
     cwd,
     repoName,
     startedAt: Date.now(),
+    channelId: null,
+    pollInterval: null,
   };
 
-  return { pid: proc.pid, cwd, repoName };
+  // Poll for tmux session death
+  session.pollInterval = setInterval(() => {
+    if (!isTmuxAlive(name)) {
+      clearInterval(session.pollInterval);
+      sessions.delete(name);
+      onExit?.(1, null);
+    }
+  }, 5000);
+
+  sessions.set(name, session);
+
+  return { pid: getClaudePid(name), cwd, repoName };
 }
 
-export async function stopSession() {
-  if (!currentSession) return false;
+export async function stopSession(name) {
+  const session = sessions.get(name);
+  if (!session) return false;
 
-  const proc = currentSession.process;
-  proc.kill('SIGTERM');
-
-  const exited = await Promise.race([
-    new Promise((resolve) => proc.on('exit', () => resolve(true))),
-    new Promise((resolve) => setTimeout(() => resolve(false), 5000)),
-  ]);
-
-  if (!exited) {
-    proc.kill('SIGKILL');
+  if (session.pollInterval) {
+    clearInterval(session.pollInterval);
   }
 
-  currentSession = null;
+  try {
+    execFileSync('tmux', ['kill-session', '-t', tmuxName(name)]);
+  } catch {
+    // Session already dead
+  }
+
+  sessions.delete(name);
   return true;
 }
 
-export function getSession() {
-  return currentSession
-    ? {
-        pid: currentSession.process.pid,
-        cwd: currentSession.cwd,
-        repoName: currentSession.repoName,
-        startedAt: currentSession.startedAt,
-      }
-    : null;
+export function getSession(name) {
+  const session = sessions.get(name);
+  if (!session) return null;
+
+  if (!isTmuxAlive(name)) {
+    if (session.pollInterval) clearInterval(session.pollInterval);
+    sessions.delete(name);
+    return null;
+  }
+
+  return {
+    name,
+    pid: getClaudePid(name),
+    cwd: session.cwd,
+    repoName: session.repoName,
+    startedAt: session.startedAt,
+    channelId: session.channelId,
+  };
 }
 
-export function isRunning() {
-  return currentSession !== null;
+export function isRunning(name) {
+  const session = sessions.get(name);
+  if (!session) return false;
+  if (!isTmuxAlive(name)) {
+    if (session.pollInterval) clearInterval(session.pollInterval);
+    sessions.delete(name);
+    return false;
+  }
+  return true;
 }
 
-export function getMemoryUsage() {
-  if (!currentSession) return null;
+export function getMemoryUsage(name) {
+  const pid = getClaudePid(name);
+  if (!pid) return null;
 
   try {
-    const output = execFileSync('ps', ['-o', 'rss=', '-p', String(currentSession.process.pid)], {
+    const output = execFileSync('ps', ['-o', 'rss=', '-p', String(pid)], {
       encoding: 'utf-8',
     });
     const rssKb = parseInt(output.trim(), 10);
@@ -93,9 +112,79 @@ export function getMemoryUsage() {
   }
 }
 
-export function sendStdin(text) {
-  if (!currentSession) {
-    throw new Error('No session running');
+export function sendInput(name, text) {
+  if (!sessions.has(name)) {
+    throw new Error(`No session "${name}" running`);
   }
-  currentSession.process.stdin.write(text);
+  execFileSync('tmux', ['send-keys', '-t', tmuxName(name), text, '']);
+}
+
+export function sendKeys(name, ...keys) {
+  if (!sessions.has(name)) {
+    throw new Error(`No session "${name}" running`);
+  }
+  for (const key of keys) {
+    execFileSync('tmux', ['send-keys', '-t', tmuxName(name), key]);
+  }
+}
+
+export function captureScreen(name) {
+  if (!sessions.has(name)) {
+    throw new Error(`No session "${name}" running`);
+  }
+
+  try {
+    const output = execSync(`tmux capture-pane -t ${tmuxName(name)} -p`, {
+      encoding: 'utf-8',
+    });
+    return output;
+  } catch (err) {
+    throw new Error(`Failed to capture screen: ${err.message}`);
+  }
+}
+
+export function setChannelId(name, channelId) {
+  const session = sessions.get(name);
+  if (session) {
+    session.channelId = channelId;
+  }
+}
+
+export function getSessionByChannelId(channelId) {
+  for (const [name, session] of sessions) {
+    if (session.channelId === channelId) {
+      return getSession(name);
+    }
+  }
+  return null;
+}
+
+export function getAllSessions() {
+  const result = [];
+  for (const name of sessions.keys()) {
+    const s = getSession(name);
+    if (s) result.push(s);
+  }
+  return result;
+}
+
+function isTmuxAlive(name) {
+  try {
+    execFileSync('tmux', ['has-session', '-t', tmuxName(name)], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function getClaudePid(name) {
+  try {
+    const output = execSync(
+      `tmux list-panes -t ${tmuxName(name)} -F '#{pane_pid}'`,
+      { encoding: 'utf-8' },
+    );
+    return parseInt(output.trim(), 10) || null;
+  } catch {
+    return null;
+  }
 }
