@@ -135,7 +135,9 @@ export function sendInput(name, text) {
   if (!sessions.has(name)) {
     throw new Error(`No session "${name}" running`);
   }
-  execFileSync('tmux', ['send-keys', '-t', tmuxName(name), text, '']);
+  const tmux = tmuxName(name);
+  execFileSync('tmux', ['send-keys', '-t', tmux, '-l', text]);
+  execFileSync('tmux', ['send-keys', '-t', tmux, 'Enter']);
 }
 
 export function sendKeys(name, ...keys) {
@@ -172,7 +174,14 @@ export function setChannelId(name, channelId) {
 export function getSessionByChannelId(channelId) {
   for (const [name, session] of sessions) {
     if (session.channelId === channelId) {
-      return getSession(name);
+      return {
+        name,
+        pid: getClaudePid(name),
+        cwd: session.cwd,
+        repoName: session.repoName,
+        startedAt: session.startedAt,
+        channelId: session.channelId,
+      };
     }
   }
   return null;

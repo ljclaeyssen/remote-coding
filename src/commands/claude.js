@@ -111,7 +111,7 @@ export const data = new SlashCommandBuilder()
     sub
       .setName('validate')
       .setDescription('Navigate down N times then press Enter (for menus)')
-      .addIntegerOption((opt) => opt.setName('option').setDescription('Menu option number (0 = just Enter)').setRequired(true).setMinValue(0).setMaxValue(10)),
+      .addIntegerOption((opt) => opt.setName('option').setDescription('Menu option number (0 = just Enter, default 0)').setRequired(false).setMinValue(0).setMaxValue(10)),
   )
   .addSubcommand((sub) =>
     sub
@@ -298,7 +298,7 @@ async function handleInput(interaction) {
   const text = interaction.options.getString('text');
 
   try {
-    sendInput(session.name, text + '\n');
+    sendInput(session.name, text);
     return interaction.reply(`Sent: \`${text}\``);
   } catch (err) {
     return interaction.reply({ content: `Failed to send input: ${err.message}`, ephemeral: true });
@@ -312,7 +312,7 @@ async function handleValidate(interaction) {
     return interaction.reply({ content: 'No session linked to this channel.', ephemeral: true });
   }
 
-  const option = interaction.options.getInteger('option');
+  const option = interaction.options.getInteger('option') ?? 0;
 
   try {
     const keys = [];

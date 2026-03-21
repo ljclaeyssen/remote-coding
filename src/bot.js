@@ -134,6 +134,7 @@ client.on('interactionCreate', async (interaction) => {
       const command = commands.get(interaction.commandName);
       if (!command) return;
       await command.execute(interaction);
+      await claudeCmd.reanchorWatch(interaction.channelId, client);
       return;
     }
 
