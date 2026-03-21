@@ -88,12 +88,6 @@ export function getSession(name) {
   const session = sessions.get(name);
   if (!session) return null;
 
-  if (!isTmuxAlive(name)) {
-    if (session.pollInterval) clearInterval(session.pollInterval);
-    sessions.delete(name);
-    return null;
-  }
-
   return {
     name,
     pid: getClaudePid(name),
@@ -105,14 +99,7 @@ export function getSession(name) {
 }
 
 export function isRunning(name) {
-  const session = sessions.get(name);
-  if (!session) return false;
-  if (!isTmuxAlive(name)) {
-    if (session.pollInterval) clearInterval(session.pollInterval);
-    sessions.delete(name);
-    return false;
-  }
-  return true;
+  return sessions.has(name);
 }
 
 export function getMemoryUsage(name) {
