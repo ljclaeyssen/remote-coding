@@ -1,0 +1,221 @@
+import 'dotenv/config';
+import { writeFileSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
+import { Client, Collection, GatewayIntentBits } from 'discord.js';
+import { setNotifyOwner, setSendToChannel } from './state.js';
+import { ensureBaseDir } from './services/repo-manager.js';
+import {
+  isRunning, getMemoryUsage, stopSession, getSession,
+  startSession, setChannelId, getAllSessions, cleanOrphanSessions,
+} from './services/claude-process.js';
+import { removeChannelGroup, getChannelGroups, clearAllGroups } from './services/access-manager.js';
+import { startWatchdog, stopWatchdog } from './watchdog.js';
+import { patchDiscordPlugin } from './services/plugin-patcher.js';
+import { notifyOwner } from './state.js';
+
+// Import commands
+import * as claudeCmd from './commands/claude.js';
+import * as reposCmd from './commands/repos.js';
+
+const { LAUNCHER_BOT_TOKEN, PLUGIN_BOT_TOKEN, OWNER_DISCORD_ID, CLAUDE_MAX_MEMORY_MB = '2048' } = process.env;
+
+// Sync plugin bot token to ~/.claude/channels/discord/.env
+if (PLUGIN_BOT_TOKEN) {
+  const pluginDir = join(process.env.HOME, '.claude', 'channels', 'discord');
+  mkdirSync(pluginDir, { recursive: true });
+  writeFileSync(join(pluginDir, '.env'), `DISCORD_BOT_TOKEN=${PLUGIN_BOT_TOKEN}\n`);
+}
+
+if (!LAUNCHER_BOT_TOKEN) {
+  console.error('LAUNCHER_BOT_TOKEN is required');
+  process.exit(1);
+}
+
+if (!OWNER_DISCORD_ID) {
+  console.error('OWNER_DISCORD_ID is required');
+  process.exit(1);
+}
+
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+});
+
+// Register commands
+const commands = new Collection();
+commands.set(claudeCmd.data.name, claudeCmd);
+commands.set(reposCmd.data.name, reposCmd);
+
+client.once('ready', async () => {
+  console.log(`Bot online as ${client.user.tag}`);
+
+  ensureBaseDir();
+
+  // Kill orphan tmux sessions from previous bot runs
+  const orphans = cleanOrphanSessions();
+  if (orphans > 0) {
+    console.log(`Cleaned ${orphans} orphan tmux session(s)`);
+  }
+
+  // Clean orphan Discord channels + access.json groups
+  const orphanChannels = getChannelGroups();
+  if (orphanChannels.length > 0) {
+    console.log(`Cleaning ${orphanChannels.length} orphan channel(s) from access.json...`);
+    for (const channelId of orphanChannels) {
+      try {
+        const channel = await client.channels.fetch(channelId);
+        if (channel) await channel.delete('Bot restart — orphan session channel');
+        console.log(`Deleted orphan channel: ${channelId}`);
+      } catch {
+        // Channel already gone or can't be fetched
+      }
+    }
+    clearAllGroups();
+  }
+
+  // Patch Discord plugin to support permissionToGroups (guild channel permissions)
+  const patchResult = patchDiscordPlugin();
+  if (patchResult.patched && patchResult.fresh) {
+    console.log(`Discord plugin patched (v${patchResult.version}) — permissionToGroups enabled`);
+  } else if (patchResult.patched) {
+    console.log(`Discord plugin already patched (v${patchResult.version}) — permissionToGroups OK`);
+  } else if (patchResult.errors.length > 0) {
+    for (const err of patchResult.errors) console.warn(err);
+  }
+
+  // Set up owner notification via DM
+  setNotifyOwner(async (msg) => {
+    try {
+      const owner = await client.users.fetch(OWNER_DISCORD_ID);
+      await owner.send(msg);
+    } catch (err) {
+      console.error('Failed to DM owner:', err.message);
+    }
+  });
+
+  // Set up channel messaging
+  setSendToChannel(async (channelId, msg) => {
+    try {
+      const channel = await client.channels.fetch(channelId);
+      if (channel) await channel.send(msg);
+    } catch (err) {
+      console.error(`Failed to send to channel ${channelId}:`, err.message);
+    }
+  });
+
+  // Start watchdog
+  const maxMb = parseInt(CLAUDE_MAX_MEMORY_MB, 10);
+  startWatchdog({
+    getAllSessions,
+    getMemoryUsage,
+    isRunning,
+    maxMb,
+    notifyFn: (msg) => notifyOwner(msg),
+    restartFn: async (name) => {
+      const session = getSession(name);
+      const cwd = session?.cwd;
+      const channelId = session?.channelId;
+      await stopSession(name);
+      if (cwd) {
+        try {
+          startSession(name, cwd, (code, signal) => {
+            notifyOwner(`Claude **${name}** exited after watchdog restart (code=${code}, signal=${signal}).`);
+          });
+          if (channelId) setChannelId(name, channelId);
+          await notifyOwner(`Claude **${name}** restarted by watchdog.`);
+        } catch (err) {
+          await notifyOwner(`Watchdog restart of **${name}** failed: ${err.message}`);
+        }
+      }
+    },
+  });
+});
+
+client.on('interactionCreate', async (interaction) => {
+  try {
+    // Auth gate
+    if (interaction.user.id !== OWNER_DISCORD_ID) {
+      if (interaction.isRepliable()) {
+        await interaction.reply({ content: 'Not authorized.', ephemeral: true });
+      }
+      return;
+    }
+
+    // Slash commands
+    if (interaction.isChatInputCommand()) {
+      const command = commands.get(interaction.commandName);
+      if (!command) return;
+      await command.execute(interaction);
+      await claudeCmd.reanchorWatch(interaction.channelId, client);
+      return;
+    }
+
+    // Autocomplete
+    if (interaction.isAutocomplete()) {
+      const command = commands.get(interaction.commandName);
+      if (command?.autocomplete) {
+        await command.autocomplete(interaction);
+      }
+      return;
+    }
+
+    // Button interactions
+    if (interaction.isButton()) {
+      await reposCmd.handleButton(interaction);
+      return;
+    }
+  } catch (err) {
+    console.error('Interaction error:', err);
+    try {
+      const content = { content: `Error: ${err.message}`, ephemeral: true };
+      if (interaction.deferred || interaction.replied) {
+        await interaction.followUp(content);
+      } else if (interaction.isRepliable()) {
+        await interaction.reply(content);
+      }
+    } catch {
+      // Can't respond, swallow
+    }
+  }
+});
+
+// Reanchor watch when owner sends a message in a watched channel
+client.on('messageCreate', async (message) => {
+  if (message.author.id !== OWNER_DISCORD_ID) return;
+  if (message.author.bot) return;
+  await claudeCmd.reanchorWatch(message.channelId, client);
+});
+
+// Global error handlers
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled rejection:', err);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err);
+});
+
+// Graceful shutdown — stop all sessions
+async function shutdown() {
+  console.log('Shutting down...');
+  stopWatchdog();
+
+  const sessions = getAllSessions();
+  for (const session of sessions) {
+    try {
+      await stopSession(session.name);
+      if (session.channelId) {
+        removeChannelGroup(session.channelId);
+      }
+    } catch {
+      // Best effort
+    }
+  }
+
+  client.destroy();
+  process.exit(0);
+}
+
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
+
+client.login(LAUNCHER_BOT_TOKEN);

@@ -1,0 +1,15 @@
+{
+  "name": "claude-discord-launcher",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Discord bot to remotely control Claude Code sessions",
+  "main": "src/bot.js",
+  "scripts": {
+    "start": "node src/bot.js",
+    "deploy-commands": "node deploy-commands.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.0",
+    "dotenv": "^16.4.0"
+  }
+}
